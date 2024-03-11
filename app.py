@@ -21,8 +21,8 @@ app = Flask(__name__)
 def connect_db():
     db = psycopg2.connect(
         host="localhost",
-        user="ade",
-        password="1234567890",
+        user="postgres",
+        password="newagepoSTgresql",
         database="masterkeydb"
     )
     return db

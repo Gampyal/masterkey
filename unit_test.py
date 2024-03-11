@@ -4,15 +4,12 @@
 
 
 
-from datetime import datetime
-from flask import Flask, request, jsonify, session
+from flask import Flask, request, jsonify
 import psycopg2
 import hashlib
 import secrets
 import bcrypt
 import smtplib
-import RPi.GPIO as GPIO
-import time
 from email.mime.text import MIMEText
 
 
@@ -22,7 +19,7 @@ def connect_db():
     db = psycopg2.connect(
         host="localhost",
         user="postgres",
-        password="kriln",
+        password="newagepoSTgresql",
         database="masterkeydb"
     )
     return db
@@ -76,7 +73,7 @@ def login():
             raise ValueError("Missing user_id or password in the request")
 
         with connect_db() as db, db.cursor() as cursor:
-            cursor.execute("SELECT unique_id, password, email FROM owners_credentials WHERE unique_id=%s", (user_id,))
+            cursor.execute("SELECT unique_id, password FROM owners_credentials WHERE unique_id=%s", (user_id,))
             user_data = cursor.fetchone()
             
 
@@ -91,6 +88,21 @@ def login():
                     return jsonify({'success': True, 'message': f'Welcome, {user_data[0]}'})
                 else:
                     return jsonify({'success': False, 'message': 'Invalid login credentials'})
+            
+            else:
+                cursor.execute("SELECT user_id, password FROM super_admin WHERE user_id=%s", (user_id,))
+                admin_data = cursor.fetchone()
+                if admin_data:
+                    stored_hashed_password = admin_data[1]
+                    user_unique_id = admin_data[0]
+
+                    # Ensure stored_hashed_password is of type bytes
+                    stored_hashed_password_bytes = stored_hashed_password.encode('utf-8')
+
+                    if bcrypt.checkpw(password.encode('utf-8'), stored_hashed_password_bytes) and user_unique_id:
+                        return jsonify({'success': True, 'message': f'Welcome, {admin_data[0]}'})
+                    else:
+                        return jsonify({'success': False, 'message': 'Invalid login credentials'})
                 
             cursor.close()
             db.close()
@@ -109,7 +121,7 @@ def new_house_owner():
         last_name = data['last_name']
         phone_number = data['phone_number']
 
-        new_owner_id, _, password = generate_owner_credentials(email, first_name, last_name, phone_number)
+        new_owner_id, password = generate_owner_credentials(email, first_name, last_name, phone_number)
 
         print(new_owner_id, password)
         send_email(new_owner_id, password, email, first_name)
@@ -126,36 +138,48 @@ def new_house_owner():
 
 def generate_owner_credentials(email, first_name, last_name, phone_number):
     try:
-        db = connect_db()
-        cursor = db.cursor()
+        with connect_db() as db:
+            cursor = db.cursor()
 
-        cursor.execute("INSERT INTO house_owners (email, first_name, last_name, phone_number) VALUES (%s, %s, %s, %s)", (email, first_name, last_name, phone_number))
-        db.commit()
+            # Check for existing email
+            cursor.execute("SELECT email FROM house_owners WHERE email = %s", (email,))
+            existing_email = cursor.fetchone()
 
-        combined_string = f"{email}{first_name}{last_name}{phone_number}"
+            if existing_email:
+                raise ValueError("Email already exists")
+            
 
-        hashed_id = hashlib.md5(combined_string.encode()).hexdigest()
+            else:
 
-        new_owner_id = hashed_id[:11]
+                cursor.execute("INSERT INTO house_owners (email, first_name, last_name, phone_number) VALUES (%s, %s, %s, %s)", (email, first_name, last_name, phone_number))
+                db.commit()
+                
 
-        new_owner_password = secrets.token_urlsafe(12)
-        # print(new_owner_id, new_owner_password)
-        salt = bcrypt.gensalt()
+                combined_string = f"{email}{first_name}{last_name}{phone_number}"
+                hashed_id = hashlib.md5(combined_string.encode()).hexdigest()
+                new_owner_id = hashed_id[:11]
 
-        # Hash the password with the generated salt
-        password = bcrypt.hashpw(new_owner_password.encode('utf8'), salt).decode('utf8')
+                new_owner_password = secrets.token_urlsafe(12)
+                salt = bcrypt.gensalt()
+                password = bcrypt.hashpw(new_owner_password.encode('utf8'), salt).decode('utf8')
 
 
-        cursor.execute("INSERT INTO owners_credentials (email, unique_id, password, salt) VALUES (%s, %s, %s, %s)", (email, new_owner_id, password, salt))
-        db.commit()
+                
+                
 
+                cursor.execute("INSERT INTO owners_credentials (email, unique_id, password, salt) VALUES (%s, %s, %s, %s)", (email, new_owner_id, password, salt))
+                db.commit()
+
+                cursor.execute("INSERT INTO gates (user_unique_id) VALUES (%s)", (new_owner_id,))
+                db.commit()
         cursor.close()
         db.close()
 
-        return new_owner_id, password, new_owner_password
+        return new_owner_id, new_owner_password
 
     except Exception as e:
-        return jsonify({'error': f'Error: {e}'}) 
+        print(f"Error generating credentials: {e}")
+        return None, None
     
 
 
@@ -192,20 +216,16 @@ def send_email(user_id, password, recipient_email, first_name):
         return jsonify({'message': 'Email sent successfully!'})
 
     except smtplib.SMTPConnectError as e:
-        print(f"SMTP Connection Error: {e}")
-        return jsonify({'error': 'Failed to connect to the SMTP server'})
+        return jsonify({'error': f'Failed to connect to the SMTP server. {e}'})
 
     except smtplib.SMTPAuthenticationError as e:
-        print(f"SMTP Authentication Error: {e}")
-        return jsonify({'error': 'SMTP authentication failed'})
+        return jsonify({'error': f'SMTP authentication failed. {e}'})
 
     except smtplib.SMTPException as e:
-        print(f"SMTP Exception: {e}")
-        return jsonify({'error': 'Error sending email'})
+        return jsonify({'error': f'{e}'})
 
     except Exception as e:
-        print(f"Unexpected Error: {e}")
-        return jsonify({'error': 'An unexpected error occurred'})
+        return jsonify({'error': f'An unexpected error occurred. {e}'})
 
 
 
@@ -247,6 +267,7 @@ def initial_password_reset():
         with connect_db() as db, db.cursor() as cursor:
             cursor.execute("SELECT * FROM owners_credentials WHERE email = %s", (email,))
             user_data = cursor.fetchone()
+            user_id = user_data[2]
 
             if not user_data:
                 return jsonify({'error': 'User not found'}), 404
@@ -261,7 +282,7 @@ def initial_password_reset():
             cursor.execute("UPDATE owners_credentials SET password = %s, salt = %s WHERE email = %s", (hashed_password, new_salt, email))
             db.commit()
 
-            return jsonify({'message': f"Password updated successfully for user {email}"}), 200
+            return jsonify({'message': f"Password updated successfully for user {user_id}"}), 200
 
     except psycopg2.Error as e:
         return jsonify({'error': f'Database error: {e}'}), 500
@@ -279,153 +300,8 @@ def initial_password_reset():
 
 
 
-# Configure GPIO pins
-GPIO.setmode(GPIO.BOARD)
-# Define the GPIO pins for gates (e.g., gate_control_pins = {1: 11, 2: 12, ...})
-
-
-with connect_db() as db, db.cursor() as cursor:
-    # Get all gate control pin information from the database
-    cursor.execute("SELECT id, gpio_pin FROM gates")
-    gate_control_pins = dict(cursor.fetchall())
-    
-    # Set up each GPIO pin specified by gate controls
-    for gpio_pin in gate_control_pins.values():
-        GPIO.setup(gpio_pin, GPIO.OUT)
-    
-    cursor.close()
-    db.close()
-    
-
-
-def authenticate(user_unique_id, password):
-    try:
-        db = connect_db
-        cursor = db.cursor()
-        cursor.execute("SELECT unique_id, password FROM owners_credentials WHERE unique_id=%s", (user_unique_id,))
-        user_data = cursor.fetchone()
-        if user_data:
-            stored_hashed_password = user_data[1].encode('utf-8')
-            if bcrypt.checkpw(password.encode('utf-8'), stored_hashed_password):
-                return True
-    except psycopg2.Error as e:
-        print("Database error:", e)
-    finally:
-        cursor.close()
-        db.close()
-    return False
-
-
-def authorize(user_unique_id, gate_id):
-    try:
-        db = connect_db()
-        cursor = db.cursor()
-        cursor.execute("SELECT user_unique_id, gate_unique_id FROM gates WHERE user_unique_id=%s", (user_unique_id,))
-        user_data = cursor.fetchone()
-        if user_data:
-            unique_gate_id = user_data[1]
-            user_unique_id = user_data[0]
-            if unique_gate_id == gate_id and user_unique_id == user_unique_id:
-                return True
-    except psycopg2.Error as e:
-        print("Database error:", e)
-    finally:
-        cursor.close()
-        db.close()
-    return False
-
-
-
-def open_gate(gate_id):
-    try:
-        db = connect_db()
-        cursor = db.cursor()
-        print(f"Opening gate {gate_id}")
-        GPIO.output(gate_control_pins[gate_id], GPIO.HIGH)
-        session['gate_id'] = gate_id
-        session['opened_at'] = time.time()  # Store the opening time in session
-        opened_at_datetime = datetime.fromtimestamp(session['opened_at'])
-        formatted_datetime = opened_at_datetime.strftime("%Y-%m-%d %H:%M:%S")
-        cursor.execute("INSERT INTO gate_logs (gate_id, opened_at) VALUES (%s, %s)", (gate_id, formatted_datetime))
-        db.commit()
-    except (psycopg2.Error, KeyError) as e:
-        print("Error opening gate:", e)
-    finally:
-        cursor.close()
-        db.close()
-
-
-def close_gate(gate_id):
-    try:
-        db = connect_db()
-        cursor = db.cursor()
-        print(f"Closing gate {gate_id}")
-        GPIO.output(gate_control_pins[gate_id], GPIO.LOW)
-        opened_at = session.pop('opened_at', None)  # Retrieve and remove opening time from session
-        if opened_at:
-            opened_at_datetime = datetime.fromtimestamp(session['opened_at'])
-            formatted_opened_at_datetime = opened_at_datetime.strftime("%Y-%m-%d %H:%M:%S")
-            closed_at = time.time()
-            formatted_closed_at_datetime = closed_at.strftime("%Y-%m-%d %H:%M:%S")
-            cursor.execute("UPDATE gate_logs SET closed_at = %s WHERE gate_id = %s AND opened_at = %s", (formatted_closed_at_datetime, gate_id, formatted_opened_at_datetime))
-            db.commit()
-        session.pop('gate_id', None)  # Remove gate ID from session
-    except (psycopg2.Error, KeyError) as e:
-        print("Error closing gate:", e)
-    finally:
-        cursor.close()
-        db.close()
-
-
-@app.route('/open_gate', methods=['POST'])
-def open_gate_route():
-    data = request.get_json()
-    user_unique_id = data.get('username')
-    password = data.get('password')
-    gate_id = data.get('gate_id')
-    
-    if authenticate(user_unique_id, password):
-        if authorize(user_unique_id, gate_id):
-            open_gate(gate_id)
-            return jsonify({'status': f'Gate {gate_id} opened'})
-        else:
-            return jsonify({'error': 'Unauthorized access'}), 403
-    else:
-        return jsonify({'error': 'Invalid username or password'}), 401
-    
-
-@app.route('/close_gate', methods=['POST'])
-def close_gate_route():
-    data = request.get_json()
-    username = data.get('username')
-    password = data.get('password')
-    gate_id = data.get('gate_id')
-    
-    if authenticate(username, password):
-        if authorize(username, gate_id):
-            close_gate(gate_id)
-            return jsonify({'status': f'Gate {gate_id} closed'})
-        else:
-            return jsonify({'error': 'Unauthorized access'}), 403
-    else:
-        return jsonify({'error': 'Invalid username or password'}), 401
-    
-
-
-
-
-
-
-
-
-
-
-
 
 
 
 if __name__ == '__main__':
-    try:
-        app.run(debug=True)
-    finally:
-        GPIO.cleanup()
+    app.run(debug=True)
