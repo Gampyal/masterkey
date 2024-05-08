@@ -23,7 +23,7 @@ def connect_db():
     db = psycopg2.connect(
         host="localhost",
         user="postgres",
-        password="newagepoSTgresql",
+        password="postgrsQl",
         database="masterkeydb"
     )
     return db
